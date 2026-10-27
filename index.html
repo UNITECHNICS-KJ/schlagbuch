@@ -82,6 +82,15 @@ button.chip { cursor: pointer }
 .btn.danger { color: var(--bad) }
 .row2 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px }
 .row2 .btn { min-height: 44px; padding: 8px; font-size: .9rem }
+.actions.has-mic { grid-template-columns: 52px 2fr 1fr 1fr }
+.btn.mic { padding: 0; display: grid; place-items: center }
+.btn.mic.on { background: var(--bad); color: #fff; border-color: transparent; animation: pulse .8s infinite alternate }
+@keyframes pulse { to { opacity: .55 } }
+.balls { display: flex; gap: 6px }
+.balls button { flex: 1; min-width: 0; padding: 8px 4px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); font: 600 .95rem/1.05 var(--f-display); white-space: nowrap }
+.balls button[aria-pressed="true"] { background: var(--brand); color: var(--brand-ink); border-color: var(--brand) }
+.balls i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; border: 1px solid rgba(0,0,0,.35) }
+.balls #b-all { flex: 1.4; white-space: normal; background: var(--flag); color: var(--flag-ink); border-color: transparent }
 
 .start { display: grid; gap: 12px }
 .start h2 { margin: 0; font: 700 1.5rem/1.1 var(--f-display); text-transform: uppercase; letter-spacing: .02em }
@@ -182,7 +191,7 @@ const KEY = "schlagbuch-niederreutin-v1";
 const TEE_NAMES = { white: "weiß", yellow: "gelb", blue: "blau", red: "rot" };
 
 /* ---------- Speicher ---------- */
-function defaults() { return { rounds: [], active: null, par: {}, learned: {}, settings: { tiles: "sat", test: false, tee: "gelb", wake: false } }; }
+function defaults() { return { rounds: [], active: null, par: {}, learned: {}, settings: { tiles: "sat", test: false, tee: "gelb", wake: false, headset: false } }; }
 function load() {
   try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && Array.isArray(s.rounds)) { const d = defaults(); return { ...d, ...s, settings: { ...d.settings, ...s.settings } }; } } catch (e) {}
   return defaults();
@@ -250,15 +259,19 @@ const nineName = n => n === "K" ? "Kurzplatz" : n;
 /* ---------- Runde ---------- */
 const round = () => store.rounds.find(r => r.id === store.active) || null;
 const seq = r => r.route.length ? r.route.flatMap(nineHoles) : ALL;
-const shotsOn = (r, h) => r.shots.filter(s => s.h === h);
-function newRound(route) {
+// Mehrere Bälle: jeder Schlag trägt b (1–3); ohne b gehört er zu Ball 1. Einzelball-Runden nutzen b = null (alle Schläge)
+const balls = r => r.balls > 1 ? Array.from({ length: r.balls }, (_, i) => i + 1) : [null];
+const shotsOn = (r, h, b = null) => r.shots.filter(s => s.h === h && (b == null || (s.b || 1) === b));
+const BALL_COL = { 1: "#f2c230", 2: "#5ec8f2", 3: "#ff7aa8" };
+function newRound(route, n) {
   const r = { id: "r" + Date.now().toString(36), start: new Date().toISOString(), route, cur: route.length ? route[0] + "1" : "A1", auto: true, shots: [], holed: {} };
-  store.rounds.unshift(r); store.active = r.id; save(); return r;
+  if (n > 1) r.balls = n;
+  ball = 1; store.rounds.unshift(r); store.active = r.id; save(); return r;
 }
 function roundName(r) {
   if (r.name) return r.name;
   const d = new Date(r.start);
-  return d.toLocaleDateString("de-DE", { weekday: "short", day: "2-digit", month: "2-digit", year: "numeric" }) + " · " + (r.route.length ? r.route.map(nineName).join(" + ") : "freie Reihenfolge");
+  return d.toLocaleDateString("de-DE", { weekday: "short", day: "2-digit", month: "2-digit", year: "numeric" }) + " · " + (r.route.length ? r.route.map(nineName).join(" + ") : "freie Reihenfolge") + (r.balls > 1 ? ` · ${r.balls} Bälle` : "");
 }
 
 // Loch automatisch erkennen
@@ -284,20 +297,21 @@ function detect(r, p) {
   return best;
 }
 // Nach dem Einputten: neuer Schlag weit weg von der Fahne gehört zum nächsten Loch (auch ohne bekannten Abschlag)
+// Bei mehreren Bällen erst, wenn jeder Ball zuletzt geputtet hat
 function nextAfterPutts(r, p) {
-  const ss = shotsOn(r, r.cur), last = ss[ss.length - 1];
-  if (!r.route.length || !last || last.k !== "putt" || dist(p, pinOf(r.cur)) <= 25) return null;
+  if (!r.route.length || dist(p, pinOf(r.cur)) <= 25) return null;
+  if (!balls(r).every(b => { const ss = shotsOn(r, r.cur, b); return ss.length && ss[ss.length - 1].k === "putt"; })) return null;
   const s = seq(r); return s[s.indexOf(r.cur) + 1] || null;
 }
 function setHole(r, h, how) {
   if (h === r.cur) return;
   if (shotsOn(r, r.cur).length) r.holed[r.cur] = true;
-  r.cur = h; save(); fitHole(h);
+  r.cur = h; ball = 1; save(); fitHole(h);
   if (how === "auto") toast(`Loch ${h} erkannt`);
 }
 
 /* ---------- Position ---------- */
-let pos = null, gpsState = "wait", club = null;
+let pos = null, gpsState = "wait", club = null, ball = 1;
 function onPosition(p) {
   pos = p;
   const r = round();
@@ -325,35 +339,51 @@ function renderGps() {
 const freshPos = () => pos && Date.now() - pos.t < 30000 ? pos : null;
 
 /* ---------- Schläge erfassen ---------- */
-function logShot(kind) {
-  const r = round(); if (!r) return;
+// o: b = Ball, all = Abschlag für alle Bälle, club = Schläger aus der Sprache, say = Ansage, heard = erkannter Text
+function logShot(kind, o = {}) {
+  const r = round(); if (!r) { if (o.say) say("Keine Runde gestartet"); return; }
   const p = freshPos();
   if (r.auto && p && kind !== "pen") {
     const h = detect(r, [p.lat, p.lng]); if (h !== r.cur) setHole(r, h, "auto");
     const nx = kind === "shot" && nextAfterPutts(r, [p.lat, p.lng]); if (nx) setHole(r, nx, "auto");
   }
-  const s = { h: r.cur, k: kind, t: Date.now() };
-  if (kind !== "pen" && p) { s.lat = +p.lat.toFixed(6); s.lng = +p.lng.toFixed(6); s.acc = Math.round(p.acc); if (p.sim) s.sim = 1; }
-  if (kind === "shot" && club) s.club = club;
-  r.shots.push(s);
-  const n = shotsOn(r, r.cur).length;
-  // Abschlag lernen: erster Schlag mit gutem GPS nahe am bekannten Abschlag
-  const known = H[r.cur].tee, here = p && [p.lat, p.lng];
-  if (kind === "shot" && n === 1 && p && !p.sim && p.acc <= 25 && (known ? dist(here, known) < 120 : dist(here, pinOf(r.cur)) < 250)) {
-    const L = store.learned[r.cur] || [p.lat, p.lng, 0];
-    const k = L[2] + 1;
-    store.learned[r.cur] = [(L[0] * L[2] + p.lat) / k, (L[1] * L[2] + p.lng) / k, k];
+  const N = balls(r).length, multi = N > 1;
+  // Strafschlag ohne Ballangabe gehört zum Ball, der zuletzt gespielt hat
+  const lastB = (shotsOn(r, r.cur).pop() || {}).b || 1;
+  const bs = !multi ? [null] : o.all ? balls(r) : [o.b || (kind === "pen" ? lastB : ball)];
+  const c = o.club !== undefined ? o.club : club, g = bs.length > 1 ? Date.now() : null;
+  for (const b of bs) {
+    const s = { h: r.cur, k: kind, t: Date.now() };
+    if (b) s.b = b;
+    if (g) s.g = g;
+    if (kind !== "pen" && p) { s.lat = +p.lat.toFixed(6); s.lng = +p.lng.toFixed(6); s.acc = Math.round(p.acc); if (p.sim) s.sim = 1; }
+    if (kind === "shot" && c) s.club = c;
+    r.shots.push(s);
+    // Abschlag lernen: erster Schlag mit gutem GPS nahe am bekannten Abschlag
+    const known = H[r.cur].tee, here = p && [p.lat, p.lng];
+    if (kind === "shot" && shotsOn(r, r.cur).length === 1 && p && !p.sim && p.acc <= 25 && (known ? dist(here, known) < 120 : dist(here, pinOf(r.cur)) < 250)) {
+      const L = store.learned[r.cur] || [p.lat, p.lng, 0];
+      const k = L[2] + 1;
+      store.learned[r.cur] = [(L[0] * L[2] + p.lat) / k, (L[1] * L[2] + p.lng) / k, k];
+    }
   }
+  // danach ist der nächste Ball dran (nach „alle“ wieder Ball 1)
+  if (multi && kind !== "pen") ball = bs.length > 1 ? 1 : bs[0] % N + 1;
   club = null; save();
   if (navigator.vibrate) navigator.vibrate(30);
   const label = kind === "putt" ? "Putt" : kind === "pen" ? "Strafschlag" : "Schlag";
-  toast(`${label} ${n} auf ${r.cur}` + (kind !== "pen" && !p ? " (ohne GPS-Position)" : ""));
+  const n = shotsOn(r, r.cur, bs[0]).length;
+  const msg = bs.length > 1 ? `Abschlag alle ${N}` : (multi ? `Ball ${bs[0]}: ` : "") + `${label} ${n}`;
+  toast((o.heard ? `„${o.heard}“ → ` : "") + `${msg} auf ${r.cur}` + (c && kind === "shot" ? ` mit ${c}` : "") + (kind !== "pen" && !p ? " (ohne GPS-Position)" : ""));
+  if (o.say) say(bs.length > 1 ? `Abschlag alle ${N}` : (multi ? `Ball ${bs[0]}, ` : "") + `${label} ${n}` + (c && kind === "shot" ? `, ${clubWord(c)}` : ""));
   renderPlay();
 }
 function undo() {
   const r = round(); if (!r || !r.shots.length) return;
-  const s = r.shots.pop(); r.holed[s.h] = false; r.cur = s.h; save();
-  toast(`Letzten Eintrag auf ${s.h} entfernt`); renderPlay();
+  const last = r.shots[r.shots.length - 1], gone = last.g ? r.shots.filter(s => s.g === last.g) : [last];
+  r.shots = r.shots.filter(s => !gone.includes(s));
+  r.holed[last.h] = false; r.cur = last.h; if (last.b) ball = gone[0].b; save();
+  toast(gone.length > 1 ? `Abschlag aller Bälle auf ${last.h} entfernt` : `Letzten Eintrag${last.b ? " von Ball " + last.b : ""} auf ${last.h} entfernt`); renderPlay();
 }
 function finishHole() {
   const r = round(); if (!r) return;
@@ -418,18 +448,21 @@ function drawHole(r) {
   }
 }
 function drawShots(layer, r, h) {
-  const a = analyseHole(r, h);
-  a.det.forEach(d => {
-    if (d.pen || !d.from) return;
-    if (d.to) L.polyline([d.from, d.to], { color: d.s.k === "putt" ? "#ffffff" : "#f2c230", weight: 3, opacity: .9 }).addTo(layer);
-    L.marker(d.from, { icon: L.divIcon({ className: "", html: `<div class="shot-ico ${d.s.k === "putt" ? "putt" : ""}">${d.n}</div>`, iconSize: [24, 24], iconAnchor: [12, 12] }) })
-      .bindTooltip(`${d.n}. ${d.s.k === "putt" ? "Putt" : d.s.club || "Schlag"}${d.len != null ? " · " + Math.round(d.len) + " m" : ""}${d.where ? " → " + d.where : ""}`).addTo(layer);
-  });
+  const multi = balls(r).length > 1;
+  for (const b of balls(r)) {
+    const a = analyseHole(r, h, b), col = BALL_COL[b || 1];
+    a.det.forEach(d => {
+      if (d.pen || !d.from) return;
+      if (d.to) L.polyline([d.from, d.to], { color: d.s.k === "putt" ? "#ffffff" : col, weight: 3, opacity: .9 }).addTo(layer);
+      L.marker(d.from, { icon: L.divIcon({ className: "", html: `<div class="shot-ico ${d.s.k === "putt" ? "putt" : ""}"${multi ? ` style="border-color:${col}"` : ""}>${d.n}</div>`, iconSize: [24, 24], iconAnchor: [12, 12] }) })
+        .bindTooltip(`${multi ? "Ball " + b + " · " : ""}${d.n}. ${d.s.k === "putt" ? "Putt" : d.s.club || "Schlag"}${d.len != null ? " · " + Math.round(d.len) + " m" : ""}${d.where ? " → " + d.where : ""}`).addTo(layer);
+    });
+  }
 }
 
 /* ---------- Auswertung ---------- */
-function analyseHole(r, h) {
-  const ss = shotsOn(r, h), pin = pinOf(h), holed = !!r.holed[h];
+function analyseHole(r, h, b = null) {
+  const ss = shotsOn(r, h, b), pin = pinOf(h), holed = !!r.holed[h];
   const det = ss.map((s, i) => {
     const n = i + 1;
     if (s.k === "pen") return { s, n, pen: true };
@@ -450,10 +483,10 @@ function analyseHole(r, h) {
   const strokes = ss.length, putts = ss.filter(s => s.k === "putt").length, pens = ss.filter(s => s.k === "pen").length;
   const reach = det.findIndex(d => d.where === "Grün" || d.where === "Loch");
   const tee = det[0] && !det[0].pen && det[0].s.k === "shot" ? det[0] : null;
-  return { h, par: par(h), strokes, putts, pens, det, holed, gir: reach >= 0 && reach + 1 <= par(h) - 2, fwElig: par(h) >= 4 && !!tee && !!tee.where, fwHit: par(h) >= 4 && !!tee && tee.where === "Fairway", tee };
+  return { h, b, par: par(h), strokes, putts, pens, det, holed, gir: reach >= 0 && reach + 1 <= par(h) - 2, fwElig: par(h) >= 4 && !!tee && !!tee.where, fwHit: par(h) >= 4 && !!tee && tee.where === "Fairway", tee };
 }
-function analyse(r) {
-  const holes = seq(r).filter(h => shotsOn(r, h).length).map(h => analyseHole(r, h));
+function analyse(r, b = null) {
+  const holes = seq(r).filter(h => shotsOn(r, h, b).length).map(h => analyseHole(r, h, b));
   const sum = (f) => holes.reduce((a, x) => a + f(x), 0);
   const drives = holes.filter(x => x.par >= 4 && x.tee && x.tee.len != null && x.tee.where !== "Strafe").map(x => x.tee);
   const allShots = holes.flatMap(x => x.det.filter(d => !d.pen && d.s.k === "shot" && d.len != null && d.where !== "Strafe" && d.where !== "Loch"));
@@ -479,7 +512,10 @@ function renderPlay() {
   bar.hidden = !r;
   if (map) drawHole(r);
   if (!r) { panel.innerHTML = startForm(); bindStart(); return; }
-  const h = r.cur, n = shotsOn(r, h).length, len = holeLen(h);
+  const bs = balls(r), multi = bs.length > 1;
+  if (multi && !bs.includes(ball)) ball = 1;
+  const sb = multi ? ball : null;
+  const h = r.cur, n = shotsOn(r, h, sb).length, len = holeLen(h);
   document.getElementById("hole-id").textContent = h;
   document.getElementById("hole-line").textContent = `Par ${par(h)} · ${len.txt}`;
   document.getElementById("hole-chips").innerHTML =
@@ -487,16 +523,18 @@ function renderPlay() {
     (parSet(h) ? "" : `<button class="chip est" id="par-chip" title="Par antippen zum Ändern">Par geschätzt · ändern</button>`) +
     (r.holed[h] ? `<span class="chip">beendet</span>` : "");
   const p = freshPos(), me = p ? [p.lat, p.lng] : null;
-  const last = shotsOn(r, h).filter(s => s.lat != null && s.k !== "pen").pop();
-  const done = analyse(r).holes.filter(x => x.holed), diff = done.reduce((a, x) => a + x.strokes - x.par, 0);
+  const last = shotsOn(r, h, sb).filter(s => s.lat != null && s.k !== "pen").pop();
+  const done = analyse(r, sb).holes.filter(x => x.holed), diff = done.reduce((a, x) => a + x.strokes - x.par, 0);
   panel.innerHTML = `
     <div class="readout">
       <div><span>zur Fahne</span><b class="num">${me ? Math.round(dist(me, pinOf(h))) : "–"}<small style="font-size:.9rem"> m</small></b></div>
-      <div><span>Schläge · Par ${par(h)}</span><b class="num">${n}</b></div>
+      <div><span>${multi ? "Ball " + ball : "Schläge"} · Par ${par(h)}</span><b class="num">${n}</b></div>
       <div><span>${last && me ? "seit letztem Schlag" : "Runde zu Par"}</span><b class="num">${last && me ? Math.round(dist(me, [last.lat, last.lng])) + '<small style="font-size:.9rem"> m</small>' : (done.length ? (diff > 0 ? "+" : "") + diff : "±0")}</b></div>
     </div>
+    ${multi ? `<div class="balls" aria-label="Welcher Ball">${bs.map(b => `<button aria-pressed="${ball === b}" data-ball="${b}"><i style="background:${BALL_COL[b]}"></i>Ball ${b} · <span class="num">${shotsOn(r, h, b).length}</span></button>`).join("")}<button id="b-all">Abschlag alle ${bs.length}</button></div>` : ""}
     <div class="clubs" aria-label="Schläger (optional)">${CLUBS.map(c => `<button aria-pressed="${club === c}" data-club="${c}">${c}</button>`).join("")}</div>
-    <div class="actions">
+    <div class="actions ${SR ? "has-mic" : ""}">
+      ${SR ? `<button class="btn mic ${listening ? "on" : ""}" id="b-mic" aria-label="Spracheingabe">${MIC_SVG}</button>` : ""}
       <button class="btn primary" id="b-shot">Schlag</button>
       <button class="btn" id="b-putt">Putt</button>
       <button class="btn" id="b-pen">+1 Strafe</button>
@@ -507,6 +545,9 @@ function renderPlay() {
       <button class="btn" id="b-done">Loch fertig ›</button>
     </div>`;
   panel.querySelectorAll("[data-club]").forEach(b => b.onclick = () => { club = club === b.dataset.club ? null : b.dataset.club; renderPlay(); });
+  panel.querySelectorAll("[data-ball]").forEach(b => b.onclick = () => { ball = +b.dataset.ball; renderPlay(); });
+  if (multi) document.getElementById("b-all").onclick = () => logShot("shot", { all: true });
+  if (SR) document.getElementById("b-mic").onclick = listen;
   document.getElementById("b-shot").onclick = () => logShot("shot");
   document.getElementById("b-putt").onclick = () => logShot("putt");
   document.getElementById("b-pen").onclick = () => logShot("pen");
@@ -518,7 +559,7 @@ function renderPlay() {
   document.getElementById("hole-line").onclick = () => cyclePar(h);
 }
 function cyclePar(h) { store.par[h] = par(h) === 5 ? 3 : par(h) + 1; save(); toast(`Par ${h} = ${par(h)} gespeichert`); renderPlay(); }
-let startSel = { a: "A", b: "B" };
+let startSel = { a: "A", b: "B", n: "1" };
 function startForm() {
   const seg = (k, opts) => `<div class="seg">${opts.map(o => `<button data-k="${k}" data-v="${o}" aria-pressed="${startSel[k] === o}">${o === "K" ? "Kurzplatz" : o || "–"}</button>`).join("")}</div>`;
   return `<div class="start">
@@ -526,6 +567,7 @@ function startForm() {
     <p>Welche Neun spielst du heute zuerst und welche danach? Die App führt dich dann Loch für Loch und schaltet am nächsten Abschlag selbst weiter.</p>
     <div><div class="lbl">Erste Runde</div>${seg("a", ["A", "B", "C", "K"])}</div>
     ${startSel.a === "K" ? `<p>Kurzplatz: 6 Löcher. Die Abschläge lernt die App bei deiner ersten Runde.</p>` : `<div><div class="lbl">Zweite Neun</div>${seg("b", ["A", "B", "C", ""])}</div>`}
+    <div><div class="lbl">Wie viele Bälle spielst du?</div>${seg("n", ["1", "2", "3"])}</div>
     <button class="btn primary" id="b-start">Runde starten</button>
     <button class="btn ghost" id="b-free">Ohne feste Reihenfolge spielen</button>
   </div>`;
@@ -534,14 +576,14 @@ function bindStart() {
   document.querySelectorAll(".start [data-k]").forEach(b => b.onclick = () => { startSel[b.dataset.k] = b.dataset.v; renderPlay(); });
   document.getElementById("b-start").onclick = () => {
     if (startSel.a !== "K" && startSel.a === startSel.b) { toast("Bitte zwei verschiedene Neun wählen oder die zweite leer lassen."); return; }
-    const r = newRound(startSel.a === "K" ? ["K"] : [startSel.a, startSel.b].filter(Boolean)); fitHole(r.cur); renderAll();
+    const r = newRound(startSel.a === "K" ? ["K"] : [startSel.a, startSel.b].filter(Boolean), +startSel.n); fitHole(r.cur); renderAll();
     if (freshPos()) onPosition(freshPos());
   };
-  document.getElementById("b-free").onclick = () => { const r = newRound([]); if (freshPos()) onPosition(freshPos()); fitHole(r.cur); renderAll(); };
+  document.getElementById("b-free").onclick = () => { const r = newRound([], +startSel.n); if (freshPos()) onPosition(freshPos()); fitHole(r.cur); renderAll(); };
 }
 
 /* ---------- Darstellung: Auswertung ---------- */
-let statsRound = null, statsHole = null;
+let statsRound = null, statsHole = null, statsBall = null;
 function renderStats() {
   const el = document.getElementById("stats");
   const rounds = store.rounds.filter(r => r.shots.length);
@@ -552,8 +594,13 @@ function renderStats() {
     document.getElementById("b-demo").onclick = makeDemo; return;
   }
   const r = rounds.find(x => x.id === statsRound) || rounds[0]; statsRound = r.id;
-  const a = analyse(r);
+  const bs = balls(r), multi = bs.length > 1;
+  if (!bs.includes(statsBall)) statsBall = bs[0];
+  const a = analyse(r, statsBall);
   if (!a.holes.some(x => x.h === statsHole)) statsHole = a.holes[0]?.h;
+  // Streuung und Schläger aus allen Bällen: mehr Daten
+  const every = bs.map(b => b === statsBall ? a : analyse(r, b)), drives = every.flatMap(e => e.drives), clubs = {};
+  every.forEach(e => Object.entries(e.clubs).forEach(([c, ds]) => (clubs[c] = clubs[c] || []).push(...ds)));
   const diff = a.finStrokes - a.par;
   const fwPct = a.fwElig ? Math.round(100 * a.fwHit / a.fwElig) : null;
   const dLen = a.drives.map(d => d.len);
@@ -564,11 +611,12 @@ function renderStats() {
         <div class="flex"><button class="btn" id="b-export">Exportieren</button></div>
       </div>
       ${r.demo ? `<p class="note">Beispielrunde mit erfundenen Schlägen. Sie zeigt nur, wie die Auswertung aussieht.</p>` : ""}
+      ${multi ? `<div class="seg" style="margin-top:10px">${every.map((e, i) => `<button data-ball="${bs[i]}" aria-pressed="${bs[i] === statsBall}">Ball ${bs[i]} · ${e.strokes}</button>`).join("")}</div>` : ""}
     </div>
-    <div class="card"><h3>Überblick · ${a.holes.length} Löcher</h3>
+    <div class="card"><h3>Überblick${multi ? " · Ball " + statsBall : ""} · ${a.holes.length} Löcher</h3>
       <div class="kpis">
         <div class="kpi"><b>${a.strokes}</b><span>Schläge · ${a.fin.length ? `${diff > 0 ? "+" : ""}${diff} zu Par nach ${a.fin.length} beendeten Löchern` : "noch kein Loch beendet"}</span></div>
-        <div class="kpi"><b>${a.putts}</b><span>Putts · ${(a.putts / a.holes.length).toFixed(1)} je Loch</span></div>
+        <div class="kpi"><b>${a.putts}</b><span>Putts · ${a.holes.length ? (a.putts / a.holes.length).toFixed(1) : "–"} je Loch</span></div>
         <div class="kpi"><b>${fwPct == null ? "–" : fwPct + " %"}</b><span>Fairways getroffen (${a.fwHit}/${a.fwElig})</span></div>
         <div class="kpi"><b>${a.gir}/${a.fin.length}</b><span>Grüns in Regulation</span></div>
         <div class="kpi"><b>${dLen.length ? Math.round(avg(dLen)) + " m" : "–"}</b><span>Abschlag Par 4/5 im Schnitt</span></div>
@@ -586,16 +634,19 @@ function renderStats() {
         <td>${x.gir ? "ja" : "–"}</td></tr>`; }).join("")}</tbody></table></div>
       <p class="note">* Par aus der Lochlänge geschätzt. Im Spielmodus kannst du es antippen und korrigieren.</p></div>
     <div class="card" id="hole-card"></div>
-    <div class="card"><h3>Abschläge Par 4/5 · Streuung</h3>${dispersion(a.drives)}</div>
-    <div class="card"><h3>Schläger</h3>${clubTable(a.clubs)}</div>`;
-  document.getElementById("sel-round").onchange = e => { statsRound = e.target.value; statsHole = null; renderStats(); };
+    <div class="card"><h3>Abschläge Par 4/5 · Streuung${multi ? " · alle Bälle" : ""}</h3>${dispersion(drives)}</div>
+    <div class="card"><h3>Schläger${multi ? " · alle Bälle" : ""}</h3>${clubTable(clubs)}</div>`;
+  document.getElementById("sel-round").onchange = e => { statsRound = e.target.value; statsHole = null; statsBall = null; renderStats(); };
+  el.querySelectorAll("[data-ball]").forEach(x => x.onclick = () => { statsBall = +x.dataset.ball; renderStats(); });
   document.getElementById("b-export").onclick = () => exportRound(r);
   el.querySelectorAll("tr[data-h]").forEach(tr => tr.onclick = () => { statsHole = tr.dataset.h; renderStats(); });
   renderHoleCard(r);
 }
 function renderHoleCard(r) {
-  const x = analyseHole(r, statsHole), c = document.getElementById("hole-card");
-  c.innerHTML = `<h3>Loch ${x.h} · Par ${x.par} · ${x.strokes} Schläge</h3>
+  const c = document.getElementById("hole-card");
+  if (!statsHole) { c.innerHTML = `<p class="muted">Mit diesem Ball ist noch kein Schlag erfasst.</p>`; return; }
+  const x = analyseHole(r, statsHole, statsBall);
+  c.innerHTML = `<h3>Loch ${x.h} · Par ${x.par} · ${x.b ? "Ball " + x.b + " · " : ""}${x.strokes} Schläge</h3>
     <div class="smap-wrap"><div id="smap"></div></div>
     <div class="tbl-wrap" style="margin-top:10px"><table>
       <thead><tr><th>#</th><th>Art</th><th>Länge</th><th>Landung</th><th>Richtung zur Fahne</th><th>Rest</th></tr></thead>
@@ -609,7 +660,7 @@ function renderHoleCard(r) {
   if (teeOf(x.h)) L.polyline([teeOf(x.h), pinOf(x.h)], { color: "#f2c230", weight: 2, dashArray: "6 6" }).addTo(sLayer);
   L.marker(pinOf(x.h), { icon: L.divIcon({ className: "", html: `<div class="pin-ico cur">⚑ ${x.h}</div>`, iconSize: [46, 20], iconAnchor: [23, 10] }) }).addTo(sLayer);
   drawShots(sLayer, r, x.h);
-  const pts = [...holeBounds(x.h), ...x.det.filter(d => d.from).map(d => d.from)];
+  const pts = [...holeBounds(x.h), ...balls(r).flatMap(b => analyseHole(r, x.h, b).det.filter(d => d.from).map(d => d.from))];
   smap.fitBounds(L.latLngBounds(pts), { padding: [30, 30], maxZoom: 18 });
 }
 function dispersion(drives) {
@@ -652,6 +703,8 @@ function renderRounds() {
       <div class="toggle"><span>Abschlagfarbe für Längenangaben</span><select id="set-tee">${["gelb", "weiß", "blau", "rot"].map(c => `<option ${s.tee === c ? "selected" : ""}>${c}</option>`).join("")}</select></div>
       <div class="toggle"><span>Kartenansicht</span><select id="set-tiles"><option value="sat" ${s.tiles === "sat" ? "selected" : ""}>Luftbild</option><option value="osm" ${s.tiles === "osm" ? "selected" : ""}>Straßenkarte</option></select></div>
       <div class="toggle"><label for="set-wake">Bildschirm während der Runde anlassen</label><input type="checkbox" id="set-wake" ${s.wake ? "checked" : ""}></div>
+      <div class="toggle"><label for="set-headset">Headset-Taste: 1× tippen = Schlag, 2× = Spracheingabe, 3× = Rückgängig</label><input type="checkbox" id="set-headset" ${s.headset ? "checked" : ""}></div>
+      <p class="note">Damit das Headset seine Taste an die App schickt, spielt die App unhörbare Stille ab, solange das an ist. Es klappt nur, solange die App offen ist; lass dazu am besten auch den Bildschirm an, sonst fehlt die GPS-Position. Ansagen kommen über das Headset.</p>
       <div class="toggle"><label for="set-test">Testmodus: Position per Tipp auf die Karte setzen</label><input type="checkbox" id="set-test" ${s.test ? "checked" : ""}></div>
       <div class="toggle"><span>Gelernte Abschläge: ${Object.keys(store.learned).length}</span><button class="btn ghost" id="b-reset-tees">Zurücksetzen</button></div>
     </div>
@@ -667,6 +720,12 @@ function renderRounds() {
   b("set-tee").onchange = e => { s.tee = e.target.value; save(); renderPlay(); };
   b("set-tiles").onchange = e => { s.tiles = e.target.value; save(); map.removeLayer(tileLayer); tileLayer = TILE[s.tiles]().addTo(map); tileLayer.bringToBack(); };
   b("set-wake").onchange = e => { s.wake = e.target.checked; save(); wake(); };
+  b("set-headset").onchange = e => {
+    s.headset = e.target.checked; save();
+    if (!s.headset) { headsetOff(); toast("Headset-Taste aus"); return; }
+    if (!("mediaSession" in navigator)) { toast("Dieser Browser gibt die Headset-Taste nicht an Webseiten weiter."); return; }
+    headsetOn(); say("Headset bereit"); toast("Headset-Taste an. Einmal tippen erfasst einen Schlag.");
+  };
   b("set-test").onchange = e => { s.test = e.target.checked; save(); renderGps(); toast(s.test ? "Testmodus an: Tippe auf die Karte, um deinen Standort zu setzen." : "Testmodus aus, echtes GPS aktiv."); };
   b("b-reset-tees").onclick = () => { store.learned = {}; save(); renderRounds(); toast("Gelernte Abschläge gelöscht"); };
 }
@@ -713,6 +772,105 @@ function makeDemo() {
   }
   store.rounds.push(r); save(); statsRound = r.id; statsHole = null; renderStats(); renderRounds();
 }
+
+/* ---------- Spracheingabe ---------- */
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const MIC_SVG = `<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>`;
+const NUM = { ein: 1, eins: 1, einen: 1, erster: 1, erste: 1, ersten: 1, zwei: 2, zwo: 2, zweiter: 2, zweite: 2, zweiten: 2, drei: 3, dritter: 3, dritte: 3, dritten: 3, dreier: 3,
+  vier: 4, vierer: 4, fünf: 5, fünfer: 5, sechs: 6, sechser: 6, sieben: 7, siebener: 7, acht: 8, achter: 8, neun: 9, neuner: 9 };
+const clubWord = c => ({ Dr: "Driver", H: "Holz", "3H": "Hybrid 3", PW: "Pitching Wedge", GW: "Gap Wedge", SW: "Sand Wedge", LW: "Lob Wedge" })[c] || "Eisen " + c;
+let rec = null, listening = false;
+// Erkennt z. B. „Ball zwei Eisen sieben“, „Abschlag alle“, „Putt Ball 3“, „Strafe“, „rückgängig“, „Loch fertig“
+function parseCmd(text) {
+  const raw = text.toLowerCase().replace(/[!?;:,]/g, " ").split(/\s+/).filter(Boolean);
+  const w = raw.map(x => { const y = x.replace(/\.$/, ""); return NUM[y] ?? (/^\d(er|\.)?$/.test(x) ? +x[0] : y); });
+  const t = w.join(" ");
+  if (/rückgängig|zurück|lösch|storn/.test(t)) return { undo: true };
+  if (/fertig|nächstes loch|eingelocht/.test(t)) return { done: true };
+  const c = { b: null, all: /\balle[n]?\b/.test(t), club: undefined, kind: null };
+  const i = w.findIndex(x => /^(ball|bal|baal|balls)$/.test(x));
+  // „zweiter Ball sieben“: Ordnungszahl davor geht vor, sonst die Zahl danach („Ball 2“)
+  const ordBefore = i > 0 && typeof w[i - 1] === "number" && /^(erst|zweit|dritt|\d\.)/.test(raw[i - 1]);
+  if (i >= 0 && !ordBefore && typeof w[i + 1] === "number") { c.b = w[i + 1]; w.splice(i, 2); }
+  else if (i > 0 && typeof w[i - 1] === "number") { c.b = w[i - 1]; w.splice(i - 1, 2); }
+  const rest = w.join(" "), nums = w.filter(x => typeof x === "number");
+  if (/\b(putt|put|putts|pat|patt)\b/.test(rest)) c.kind = "putt";
+  else if (/straf/.test(rest)) c.kind = "pen";
+  if (/driver/.test(rest)) c.club = "Dr";
+  else if (/hybrid|rescue/.test(rest)) c.club = nums.includes(3) ? "3H" : "H";
+  else if (/holz/.test(rest)) c.club = "H";
+  else if (/pitch/.test(rest)) c.club = "PW";
+  else if (/\bgap/.test(rest)) c.club = "GW";
+  else if (/sand/.test(rest)) c.club = "SW";
+  else if (/\blob/.test(rest)) c.club = "LW";
+  else { const n = nums.find(x => x >= 4 && x <= 9); if (n) c.club = String(n); }
+  if (!c.kind && (c.all || c.b || c.club || /schlag/.test(rest))) c.kind = "shot";
+  return c.kind ? c : null;
+}
+function handleSpeech(alts) {
+  const r = round();
+  for (const a of alts) {
+    const c = parseCmd(a); if (!c) continue;
+    if (c.undo) { undo(); say("Gelöscht"); return; }
+    if (c.done) { finishHole(); say(r ? "Weiter auf " + round().cur : "Keine Runde"); return; }
+    const N = r ? balls(r).length : 1;
+    if (c.b > N) { toast(`„${a}“: Diese Runde hat ${N > 1 ? "nur " + N + " Bälle" : "nur einen Ball"}.`); say("Den Ball gibt es nicht"); return; }
+    logShot(c.kind, { b: c.b, all: c.all, club: c.club, say: true, heard: a });
+    return;
+  }
+  toast(alts[0] ? `Nicht verstanden: „${alts[0]}“` : "Nichts verstanden"); say("Nicht verstanden");
+}
+function listen() {
+  if (!SR) { toast("Spracheingabe gibt es in diesem Browser nicht."); return; }
+  if (!round()) { toast("Bitte zuerst eine Runde starten."); return; }
+  if (listening) { rec.abort(); return; }
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  rec = new SR(); rec.lang = "de-DE"; rec.interimResults = false; rec.maxAlternatives = 5;
+  rec.onresult = e => handleSpeech([...e.results[0]].map(x => x.transcript.trim()));
+  rec.onerror = e => toast({ "not-allowed": "Mikrofon ist nicht freigegeben.", "service-not-allowed": "Mikrofon ist nicht freigegeben.", "no-speech": "Nichts gehört.", network: "Die Spracheingabe braucht Netz." }[e.error] || "Spracheingabe abgebrochen.");
+  rec.onend = () => { listening = false; renderPlay(); if (store.settings.headset) headsetOn(); };
+  try { rec.start(); listening = true; renderPlay(); toast("Ich höre … z. B. „Ball zwei, Eisen sieben“"); }
+  catch (e) { toast("Das Mikrofon lässt sich gerade nicht starten."); }
+}
+function say(text) {
+  if (!("speechSynthesis" in window)) return;
+  const u = new SpeechSynthesisUtterance(text); u.lang = "de-DE"; u.rate = 1.1;
+  speechSynthesis.cancel(); speechSynthesis.speak(u);
+}
+
+/* ---------- Headset-Taste ---------- */
+// Das Headset schickt Play/Pause nur an eine Seite, die gerade Ton abspielt; deshalb läuft unhörbare Stille in Schleife
+let silent = null, lastTap = 0;
+function silentWav(sec = 10, rate = 8000) {
+  const n = sec * rate, v = new DataView(new ArrayBuffer(44 + n * 2)), str = (o, s) => [...s].forEach((ch, i) => v.setUint8(o + i, ch.charCodeAt(0)));
+  str(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); str(8, "WAVEfmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, "data"); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, i % 2 ? 1 : -1, true); // ±1 von 32768: nicht hörbar, gilt aber nicht als stumm
+  return URL.createObjectURL(new Blob([v], { type: "audio/wav" }));
+}
+function headsetOn() {
+  if (!store.settings.headset || !("mediaSession" in navigator)) return;
+  if (!silent) { silent = new Audio(silentWav()); silent.loop = true; }
+  silent.play().catch(() => {});
+  const ms = navigator.mediaSession;
+  if ("MediaMetadata" in window) ms.metadata = new MediaMetadata({ title: "Schlagbuch", artist: "1× Schlag · 2× Sprache · 3× Rückgängig" });
+  const tap = act => () => {
+    silent.play().catch(() => {}); ms.playbackState = "playing";
+    if (Date.now() - lastTap < 400) return; lastTap = Date.now();
+    if (act === "shot") logShot("shot", { say: true });
+    else if (act === "voice") listen();
+    else { undo(); say("Gelöscht"); }
+  };
+  const set = (a, f) => { try { ms.setActionHandler(a, f); } catch (e) {} };
+  set("play", tap("shot")); set("pause", tap("shot")); set("nexttrack", tap("voice")); set("previoustrack", tap("undo"));
+  ms.playbackState = "playing";
+}
+function headsetOff() {
+  if (silent) silent.pause();
+  if ("mediaSession" in navigator) ["play", "pause", "nexttrack", "previoustrack"].forEach(a => { try { navigator.mediaSession.setActionHandler(a, null); } catch (e) {} });
+}
+// Ton darf erst nach einer Berührung starten; nach Neuladen oder Unterbrechung reicht ein Tipp irgendwo in die App
+document.addEventListener("pointerdown", () => { if (store.settings.headset && (!silent || silent.paused)) headsetOn(); });
 
 /* ---------- Allgemein ---------- */
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
