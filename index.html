@@ -191,9 +191,18 @@ const KEY = "schlagbuch-niederreutin-v1";
 const TEE_NAMES = { white: "weiß", yellow: "gelb", blue: "blau", red: "rot" };
 
 /* ---------- Speicher ---------- */
-function defaults() { return { rounds: [], active: null, par: {}, learned: {}, settings: { tiles: "sat", test: false, tee: "gelb", wake: false, headset: false } }; }
+// remote: Fernbedienung über Medientasten – "off", "headset" oder "watch" (Smartwatch-Musiksteuerung)
+function defaults() { return { rounds: [], active: null, par: {}, learned: {}, settings: { tiles: "sat", test: false, tee: "gelb", wake: false, remote: "off" } }; }
 function load() {
-  try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && Array.isArray(s.rounds)) { const d = defaults(); return { ...d, ...s, settings: { ...d.settings, ...s.settings } }; } } catch (e) {}
+  try {
+    const s = JSON.parse(localStorage.getItem(KEY));
+    if (s && Array.isArray(s.rounds)) {
+      const d = defaults(), st = { ...d.settings, ...s.settings };
+      if (st.headset && st.remote === "off") st.remote = "headset"; // alte Einstellung übernehmen
+      delete st.headset;
+      return { ...d, ...s, settings: st };
+    }
+  } catch (e) {}
   return defaults();
 }
 let store = load();
@@ -266,7 +275,7 @@ const BALL_COL = { 1: "#f2c230", 2: "#5ec8f2", 3: "#ff7aa8" };
 function newRound(route, n) {
   const r = { id: "r" + Date.now().toString(36), start: new Date().toISOString(), route, cur: route.length ? route[0] + "1" : "A1", auto: true, shots: [], holed: {} };
   if (n > 1) r.balls = n;
-  ball = 1; store.rounds.unshift(r); store.active = r.id; save(); return r;
+  ball = 1; remoteNote = "Runde gestartet"; store.rounds.unshift(r); store.active = r.id; save(); return r;
 }
 function roundName(r) {
   if (r.name) return r.name;
@@ -307,6 +316,7 @@ function setHole(r, h, how) {
   if (h === r.cur) return;
   if (shotsOn(r, r.cur).length) r.holed[r.cur] = true;
   r.cur = h; ball = 1; save(); fitHole(h);
+  remoteNote = how === "auto" ? `Loch ${h} erkannt` : `Loch ${h}`;
   if (how === "auto") toast(`Loch ${h} erkannt`);
 }
 
@@ -341,7 +351,7 @@ const freshPos = () => pos && Date.now() - pos.t < 30000 ? pos : null;
 /* ---------- Schläge erfassen ---------- */
 // o: b = Ball, all = Abschlag für alle Bälle, club = Schläger aus der Sprache, say = Ansage, heard = erkannter Text
 function logShot(kind, o = {}) {
-  const r = round(); if (!r) { if (o.say) say("Keine Runde gestartet"); return; }
+  const r = round(); if (!r) { if (o.say) say("Keine Runde gestartet"); remoteNote = "Keine Runde gestartet"; remoteSync(); return; }
   const p = freshPos();
   if (r.auto && p && kind !== "pen") {
     const h = detect(r, [p.lat, p.lng]); if (h !== r.cur) setHole(r, h, "auto");
@@ -375,22 +385,34 @@ function logShot(kind, o = {}) {
   const n = shotsOn(r, r.cur, bs[0]).length;
   const msg = bs.length > 1 ? `Abschlag alle ${N}` : (multi ? `Ball ${bs[0]}: ` : "") + `${label} ${n}`;
   toast((o.heard ? `„${o.heard}“ → ` : "") + `${msg} auf ${r.cur}` + (c && kind === "shot" ? ` mit ${c}` : "") + (kind !== "pen" && !p ? " (ohne GPS-Position)" : ""));
+  remoteNote = "Erfasst: " + msg.replace(": ", " · ") + (kind !== "pen" && !p ? " (ohne GPS)" : "");
   if (o.say) say(bs.length > 1 ? `Abschlag alle ${N}` : (multi ? `Ball ${bs[0]}, ` : "") + `${label} ${n}` + (c && kind === "shot" ? `, ${clubWord(c)}` : ""));
   renderPlay();
 }
 function undo() {
-  const r = round(); if (!r || !r.shots.length) return;
+  const r = round(); if (!r || !r.shots.length) { remoteNote = "Nichts zum Löschen"; remoteSync(); return false; }
   const last = r.shots[r.shots.length - 1], gone = last.g ? r.shots.filter(s => s.g === last.g) : [last];
   r.shots = r.shots.filter(s => !gone.includes(s));
   r.holed[last.h] = false; r.cur = last.h; if (last.b) ball = gone[0].b; save();
+  remoteNote = gone.length > 1 ? "Gelöscht: Abschlag alle" : "Gelöscht" + (last.b ? ` (Ball ${last.b})` : "");
   toast(gone.length > 1 ? `Abschlag aller Bälle auf ${last.h} entfernt` : `Letzten Eintrag${last.b ? " von Ball " + last.b : ""} auf ${last.h} entfernt`); renderPlay();
+  return true;
+}
+// Uhr: nächster Ball ist dran (bei nur einem Ball sagt sie den Stand an)
+function nextBall() {
+  const r = round();
+  if (!r) { remoteNote = "Keine Runde gestartet"; say("Keine Runde gestartet"); remoteSync(); return; }
+  const N = balls(r).length;
+  if (N > 1) { ball = ball % N + 1; remoteNote = `Ball ${ball} gewählt`; say(`Ball ${ball}`); }
+  else { const n = shotsOn(r, r.cur).length; remoteNote = `Loch ${r.cur}`; say(`Loch ${r.cur}, ${n} ${n === 1 ? "Schlag" : "Schläge"}`); }
+  renderPlay();
 }
 function finishHole() {
   const r = round(); if (!r) return;
   if (!shotsOn(r, r.cur).length) { toast("Auf diesem Loch ist noch kein Schlag erfasst."); return; }
   r.holed[r.cur] = true;
   const s = seq(r), next = s[s.indexOf(r.cur) + 1];
-  if (r.route.length && next) { r.cur = next; save(); fitHole(next); toast(`Weiter auf ${next}`); }
+  if (r.route.length && next) { r.cur = next; ball = 1; remoteNote = `Weiter auf ${next}`; save(); fitHole(next); toast(`Weiter auf ${next}`); }
   else if (r.route.length) { save(); toast("Letztes Loch gespielt. Die Auswertung ist fertig."); }
   else { save(); toast(`${r.cur} abgeschlossen`); }
   renderPlay();
@@ -511,9 +533,10 @@ function renderPlay() {
   const r = round(), bar = document.getElementById("holebar"), panel = document.getElementById("panel");
   bar.hidden = !r;
   if (map) drawHole(r);
-  if (!r) { panel.innerHTML = startForm(); bindStart(); return; }
+  if (!r) { panel.innerHTML = startForm(); bindStart(); remoteSync(); return; }
   const bs = balls(r), multi = bs.length > 1;
   if (multi && !bs.includes(ball)) ball = 1;
+  remoteSync();
   const sb = multi ? ball : null;
   const h = r.cur, n = shotsOn(r, h, sb).length, len = holeLen(h);
   document.getElementById("hole-id").textContent = h;
@@ -703,8 +726,10 @@ function renderRounds() {
       <div class="toggle"><span>Abschlagfarbe für Längenangaben</span><select id="set-tee">${["gelb", "weiß", "blau", "rot"].map(c => `<option ${s.tee === c ? "selected" : ""}>${c}</option>`).join("")}</select></div>
       <div class="toggle"><span>Kartenansicht</span><select id="set-tiles"><option value="sat" ${s.tiles === "sat" ? "selected" : ""}>Luftbild</option><option value="osm" ${s.tiles === "osm" ? "selected" : ""}>Straßenkarte</option></select></div>
       <div class="toggle"><label for="set-wake">Bildschirm während der Runde anlassen</label><input type="checkbox" id="set-wake" ${s.wake ? "checked" : ""}></div>
-      <div class="toggle"><label for="set-headset">Headset-Taste: 1× tippen = Schlag, 2× = Spracheingabe, 3× = Rückgängig</label><input type="checkbox" id="set-headset" ${s.headset ? "checked" : ""}></div>
-      <p class="note">Damit das Headset seine Taste an die App schickt, spielt die App unhörbare Stille ab, solange das an ist. Es klappt nur, solange die App offen ist; lass dazu am besten auch den Bildschirm an, sonst fehlt die GPS-Position. Ansagen kommen über das Headset.</p>
+      <div class="toggle"><label for="set-remote">Fernbedienung</label><select id="set-remote">${[["off", "aus"], ["headset", "Headset-Taste"], ["watch", "Smartwatch"]].map(([v, t]) => `<option value="${v}" ${s.remote === v ? "selected" : ""}>${t}</option>`).join("")}</select></div>
+      ${s.remote === "watch" ? `<p class="note">Auf der Uhr die Musik-Steuerung fürs Handy öffnen (Gear S3: Musik-App, Quelle „Telefon“). Dort steht dann „Schlagbuch“.<br>▶/❚❚ = Schlag für den Ball, der dran ist · ⏭ = nächster Ball · ⏮ = Rückgängig.<br>Nach jedem Druck zeigt die Uhr, was erfasst wurde, auf welchem Loch du bist und welcher Ball als Nächstes dran ist. Kommt nichts an, ändert sich die Anzeige nicht.</p>` : ""}
+      ${s.remote === "headset" ? `<p class="note">1× tippen = Schlag, 2× = Spracheingabe, 3× = Rückgängig. Ansagen kommen über das Headset.</p>` : ""}
+      ${s.remote !== "off" ? `<p class="note">Damit die Tasten bei der App ankommen, spielt sie unhörbare Stille ab, solange das an ist. Es klappt nur, solange die App im Browser offen ist; lass dazu am besten auch den Bildschirm an, sonst fehlt die GPS-Position.</p>` : ""}
       <div class="toggle"><label for="set-test">Testmodus: Position per Tipp auf die Karte setzen</label><input type="checkbox" id="set-test" ${s.test ? "checked" : ""}></div>
       <div class="toggle"><span>Gelernte Abschläge: ${Object.keys(store.learned).length}</span><button class="btn ghost" id="b-reset-tees">Zurücksetzen</button></div>
     </div>
@@ -720,11 +745,13 @@ function renderRounds() {
   b("set-tee").onchange = e => { s.tee = e.target.value; save(); renderPlay(); };
   b("set-tiles").onchange = e => { s.tiles = e.target.value; save(); map.removeLayer(tileLayer); tileLayer = TILE[s.tiles]().addTo(map); tileLayer.bringToBack(); };
   b("set-wake").onchange = e => { s.wake = e.target.checked; save(); wake(); };
-  b("set-headset").onchange = e => {
-    s.headset = e.target.checked; save();
-    if (!s.headset) { headsetOff(); toast("Headset-Taste aus"); return; }
-    if (!("mediaSession" in navigator)) { toast("Dieser Browser gibt die Headset-Taste nicht an Webseiten weiter."); return; }
-    headsetOn(); say("Headset bereit"); toast("Headset-Taste an. Einmal tippen erfasst einen Schlag.");
+  b("set-remote").onchange = e => {
+    s.remote = e.target.value; save(); renderRounds();
+    if (s.remote === "off") { remoteOff(); toast("Fernbedienung aus"); return; }
+    if (!("mediaSession" in navigator)) { toast("Dieser Browser gibt Medientasten nicht an Webseiten weiter."); return; }
+    remoteNote = ""; remoteOn();
+    if (s.remote === "watch") { say("Uhr bereit"); toast("Smartwatch an. Öffne auf der Uhr die Musik-Steuerung, dort steht „Schlagbuch“."); }
+    else { say("Headset bereit"); toast("Headset-Taste an. Einmal tippen erfasst einen Schlag."); }
   };
   b("set-test").onchange = e => { s.test = e.target.checked; save(); renderGps(); toast(s.test ? "Testmodus an: Tippe auf die Karte, um deinen Standort zu setzen." : "Testmodus aus, echtes GPS aktiv."); };
   b("b-reset-tees").onclick = () => { store.learned = {}; save(); renderRounds(); toast("Gelernte Abschläge gelöscht"); };
@@ -828,7 +855,7 @@ function listen() {
   rec = new SR(); rec.lang = "de-DE"; rec.interimResults = false; rec.maxAlternatives = 5;
   rec.onresult = e => handleSpeech([...e.results[0]].map(x => x.transcript.trim()));
   rec.onerror = e => toast({ "not-allowed": "Mikrofon ist nicht freigegeben.", "service-not-allowed": "Mikrofon ist nicht freigegeben.", "no-speech": "Nichts gehört.", network: "Die Spracheingabe braucht Netz." }[e.error] || "Spracheingabe abgebrochen.");
-  rec.onend = () => { listening = false; renderPlay(); if (store.settings.headset) headsetOn(); };
+  rec.onend = () => { listening = false; renderPlay(); if (store.settings.remote !== "off") remoteOn(); };
   try { rec.start(); listening = true; renderPlay(); toast("Ich höre … z. B. „Ball zwei, Eisen sieben“"); }
   catch (e) { toast("Das Mikrofon lässt sich gerade nicht starten."); }
 }
@@ -838,9 +865,10 @@ function say(text) {
   speechSynthesis.cancel(); speechSynthesis.speak(u);
 }
 
-/* ---------- Headset-Taste ---------- */
-// Das Headset schickt Play/Pause nur an eine Seite, die gerade Ton abspielt; deshalb läuft unhörbare Stille in Schleife
-let silent = null, lastTap = 0;
+/* ---------- Fernbedienung: Headset-Taste oder Smartwatch ---------- */
+// Headset und Uhr schicken Play/Pause/Vor/Zurück nur an eine Seite, die gerade Ton abspielt; deshalb läuft unhörbare Stille in Schleife.
+// Die Uhr (Musik-Steuerung fürs Handy) zeigt Titel, Untertitel und Bild dieser Wiedergabe – darüber kommt die Rückmeldung.
+let silent = null, lastTap = 0, remoteNote = "", remoteKey = "";
 function silentWav(sec = 10, rate = 8000) {
   const n = sec * rate, v = new DataView(new ArrayBuffer(44 + n * 2)), str = (o, s) => [...s].forEach((ch, i) => v.setUint8(o + i, ch.charCodeAt(0)));
   str(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); str(8, "WAVEfmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
@@ -848,29 +876,65 @@ function silentWav(sec = 10, rate = 8000) {
   for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, i % 2 ? 1 : -1, true); // ±1 von 32768: nicht hörbar, gilt aber nicht als stumm
   return URL.createObjectURL(new Blob([v], { type: "audio/wav" }));
 }
-function headsetOn() {
-  if (!store.settings.headset || !("mediaSession" in navigator)) return;
+// Play/Pause = Schlag; Vor = Spracheingabe (Headset, 2× tippen) bzw. nächster Ball (Uhr); Zurück = Rückgängig
+function remoteOn() {
+  if (store.settings.remote === "off" || !("mediaSession" in navigator)) return;
   if (!silent) { silent = new Audio(silentWav()); silent.loop = true; }
   silent.play().catch(() => {});
   const ms = navigator.mediaSession;
-  if ("MediaMetadata" in window) ms.metadata = new MediaMetadata({ title: "Schlagbuch", artist: "1× Schlag · 2× Sprache · 3× Rückgängig" });
   const tap = act => () => {
     silent.play().catch(() => {}); ms.playbackState = "playing";
     if (Date.now() - lastTap < 400) return; lastTap = Date.now();
     if (act === "shot") logShot("shot", { say: true });
-    else if (act === "voice") listen();
-    else { undo(); say("Gelöscht"); }
+    else if (act === "next") { if (store.settings.remote === "watch") nextBall(); else listen(); }
+    else say(undo() ? "Gelöscht" : "Nichts zum Löschen");
   };
   const set = (a, f) => { try { ms.setActionHandler(a, f); } catch (e) {} };
-  set("play", tap("shot")); set("pause", tap("shot")); set("nexttrack", tap("voice")); set("previoustrack", tap("undo"));
+  set("play", tap("shot")); set("pause", tap("shot")); set("nexttrack", tap("next")); set("previoustrack", tap("undo"));
   ms.playbackState = "playing";
+  remoteSync(true);
 }
-function headsetOff() {
+function remoteOff() {
   if (silent) silent.pause();
-  if ("mediaSession" in navigator) ["play", "pause", "nexttrack", "previoustrack"].forEach(a => { try { navigator.mediaSession.setActionHandler(a, null); } catch (e) {} });
+  if ("mediaSession" in navigator) {
+    ["play", "pause", "nexttrack", "previoustrack"].forEach(a => { try { navigator.mediaSession.setActionHandler(a, null); } catch (e) {} });
+    navigator.mediaSession.metadata = null;
+  }
+  remoteKey = "";
+}
+// Anzeige auf Uhr und Sperrbildschirm: Titel = was zuletzt passiert ist, Untertitel = Loch und welcher Ball als Nächstes dran ist.
+// Nur neu setzen, wenn sich etwas ändert (renderPlay läuft bei jeder GPS-Position)
+function remoteSync(force) {
+  if (store.settings.remote === "off" || !("mediaSession" in navigator) || !("MediaMetadata" in window)) return;
+  const r = round(), multi = !!r && balls(r).length > 1;
+  const title = remoteNote || (r ? `Loch ${r.cur}` : "Schlagbuch bereit");
+  let artist = "Noch keine Runde gestartet";
+  if (r) {
+    const n = shotsOn(r, r.cur, multi ? ball : null).length;
+    artist = `Loch ${r.cur} · ` + (multi ? `jetzt Ball ${ball} (bisher ${n})` : `bisher ${n} ${n === 1 ? "Schlag" : "Schläge"}`);
+  }
+  const key = [title, artist, r ? r.cur : "", multi ? ball : 0].join("|");
+  if (!force && key === remoteKey) return;
+  remoteKey = key;
+  try { navigator.mediaSession.metadata = new MediaMetadata({ title, artist, album: "Schlagbuch", artwork: [{ src: remoteArt(r, multi), sizes: "256x256", type: "image/png" }] }); } catch (e) {}
+}
+// Bild für die Uhr (rund beschnitten, deshalb alles mittig): Loch oben, darunter groß der Ball, der dran ist, in seiner Farbe;
+// bei nur einem Ball die Zahl der Schläge auf dem Loch
+function remoteArt(r, multi) {
+  const c = document.createElement("canvas"); c.width = c.height = 256;
+  const x = c.getContext("2d");
+  x.fillStyle = "#123a2b"; x.fillRect(0, 0, 256, 256);
+  x.textAlign = "center"; x.textBaseline = "middle"; x.fillStyle = "#f2f6f0";
+  if (!r) { x.font = "bold 34px sans-serif"; x.fillText("Schlagbuch", 128, 128); return c.toDataURL("image/png"); }
+  x.font = "bold 40px sans-serif"; x.fillText(r.cur, 128, 66);
+  if (multi) {
+    x.fillStyle = BALL_COL[ball]; x.beginPath(); x.arc(128, 160, 62, 0, 2 * Math.PI); x.fill();
+    x.fillStyle = "#111"; x.font = "bold 88px sans-serif"; x.fillText(String(ball), 128, 166);
+  } else { x.font = "bold 96px sans-serif"; x.fillText(String(shotsOn(r, r.cur).length), 128, 166); }
+  return c.toDataURL("image/png");
 }
 // Ton darf erst nach einer Berührung starten; nach Neuladen oder Unterbrechung reicht ein Tipp irgendwo in die App
-document.addEventListener("pointerdown", () => { if (store.settings.headset && (!silent || silent.paused)) headsetOn(); });
+document.addEventListener("pointerdown", () => { if (store.settings.remote !== "off" && (!silent || silent.paused)) remoteOn(); });
 
 /* ---------- Allgemein ---------- */
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
